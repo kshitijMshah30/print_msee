@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Print a PDF to Purdue MSEE190; credentials stay in ~/.print_msee."""
+import argparse
+import ctypes as c
+import getpass
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import time
+
+PRINTER = "Purdue_MSEE190"
+
+
+def credentials():
+    path = Path.home() / ".print_msee"
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError("~/.print_msee must be owned by you with permissions 600")
+        data = json.load(stream)
+    for key in ("username", "password"):
+        if not isinstance(data.get(key), str) or not data[key] or "\0" in data[key]:
+            raise ValueError("Credential file needs nonempty username and password strings")
+    return data
+
+
+class Cups:
+    def __init__(self):
+        self.lib = c.CDLL("/usr/lib/libcups.2.dylib")
+        signatures = {
+            "ippNewRequest": ([c.c_int], c.c_void_p),
+            "ippAddString": ([c.c_void_p, c.c_int, c.c_int, c.c_char_p, c.c_char_p, c.c_char_p], c.c_void_p),
+            "ippAddStrings": ([c.c_void_p, c.c_int, c.c_int, c.c_char_p, c.c_int, c.c_char_p, c.POINTER(c.c_char_p)], c.c_void_p),
+            "cupsDoRequest": ([c.c_void_p, c.c_void_p, c.c_char_p], c.c_void_p),
+            "ippFindAttribute": ([c.c_void_p, c.c_char_p, c.c_int], c.c_void_p),
+            "ippGetInteger": ([c.c_void_p, c.c_int], c.c_int),
+            "ippGetString": ([c.c_void_p, c.c_int, c.c_void_p], c.c_char_p),
+            "ippGetCount": ([c.c_void_p], c.c_int),
+            "ippGetStatusCode": ([c.c_void_p], c.c_int),
+            "ippDelete": ([c.c_void_p], None),
+            "cupsAddOption": ([c.c_char_p, c.c_char_p, c.c_int, c.POINTER(c.c_void_p)], c.c_int),
+            "cupsFreeOptions": ([c.c_int, c.c_void_p], None),
+            "cupsPrintFile": ([c.c_char_p, c.c_char_p, c.c_char_p, c.c_int, c.c_void_p], c.c_int),
+        }
+        for name, (args, result) in signatures.items():
+            fn = getattr(self.lib, name)
+            fn.argtypes, fn.restype = args, result
+
+    def submit(self, path, single):
+        options, count = c.c_void_p(), 0
+        values = {"copies": "1", "PageSize": "Letter", "Option1": "True",
+                  "Duplex": "None" if single else "DuplexNoTumble",
+                  "sides": "one-sided" if single else "two-sided-long-edge"}
+        try:
+            for key, value in values.items():
+                count = self.lib.cupsAddOption(key.encode(), value.encode(), count, c.byref(options))
+            job = self.lib.cupsPrintFile(PRINTER.encode(), os.fsencode(path), path.name.encode(), count, options)
+            if job <= 0:
+                raise ValueError("Unable to submit PDF; check that Purdue_MSEE190 is installed")
+            return job
+        finally:
+            self.lib.cupsFreeOptions(count, options)
+
+    def request(self, operation, job, auth=None):
+        lib = self.lib
+        req = lib.ippNewRequest(operation)
+        lib.ippAddString(req, 1, 0x45, b"job-uri", None, f"ipp://localhost/jobs/{job}".encode())
+        lib.ippAddString(req, 1, 0x42, b"requesting-user-name", None, getpass.getuser().encode())
+        if auth:
+            values = (c.c_char_p * 2)(auth["username"].encode(), auth["password"].encode())
+            lib.ippAddStrings(req, 1, 0x41, b"auth-info", 2, None, values)
+        response = lib.cupsDoRequest(None, req, b"/jobs/")
+        if not response:
+            raise ValueError("Cannot communicate with the local print service")
+        return response
+
+    def status(self, job):
+        response = self.request(9, job)  # Get-Job-Attributes
+        try:
+            if self.lib.ippGetStatusCode(response) >= 0x400:
+                raise ValueError("Cannot read print-job status")
+            attr = self.lib.ippFindAttribute(response, b"job-state", 0x23)
+            if not attr:
+                raise ValueError("Print service returned no job state")
+            state = self.lib.ippGetInteger(attr, 0)
+            attr = self.lib.ippFindAttribute(response, b"job-state-reasons", 0x44)
+            reasons = [self.lib.ippGetString(attr, i, None) for i in range(self.lib.ippGetCount(attr))] if attr else []
+            return state, b"cups-held-for-authentication" in reasons
+        finally:
+            self.lib.ippDelete(response)
+
+    def authenticate(self, job, auth):
+        response = self.request(0x400e, job, auth)
+        try:
+            if self.lib.ippGetStatusCode(response) >= 0x400:
+                raise ValueError("Print authentication failed; check credentials and Print Center")
+        finally:
+            self.lib.ippDelete(response)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("pdf", type=Path)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--single", action="store_true", help="print one-sided")
+    mode.add_argument("--double", action="store_true", help="print two-sided, long-edge binding (default)")
+    args = parser.parse_args()
+    job = None
+    try:
+        path = args.pdf.expanduser().resolve()
+        with path.open("rb") as source:
+            if b"%PDF-" not in source.read(1024):
+                raise ValueError("Input is not a PDF")
+        auth = credentials()
+        cups = Cups()
+        job = cups.submit(path, args.single)
+        print(f"Submitted {PRINTER}-{job} ({'single' if args.single else 'double'}-sided)", flush=True)
+        authenticated = False
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            state, needs_auth = cups.status(job)
+            if state == 9:
+                print("macOS reports the print job completed.")
+                return 0
+            if state in (7, 8):
+                raise ValueError("Print job was canceled or aborted; check Print Center")
+            if needs_auth:
+                if authenticated:
+                    raise ValueError("Purdue did not accept authentication; check ~/.print_msee")
+                cups.authenticate(job, auth)
+                authenticated = True
+            time.sleep(2)
+        print("Job is still pending. Check Print Center before submitting again.", file=sys.stderr)
+        return 2
+    except (OSError, ValueError):
+        # Never echo exception content: malformed credentials may contain secrets.
+        print("Printing could not complete. Check the PDF, ~/.print_msee (permissions 600), printer and Purdue connection.", file=sys.stderr)
+        if job:
+            print(f"Check existing job {PRINTER}-{job} in Print Center before retrying.", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
