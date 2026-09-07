@@ -7,10 +7,67 @@ import json
 import os
 from pathlib import Path
 import stat
+import shlex
+import subprocess
 import sys
 import time
 
 PRINTER = "Purdue_MSEE190"
+
+PRINTER_URI = "smb://ecnprint05.itap.purdue.edu/msee190p1-ps"
+DRIVER = "drv:///sample.drv/generic.ppd"
+
+
+class SetupError(Exception):
+    """A safe, user-facing printer setup error."""
+
+
+def printer_ready():
+    result = subprocess.run(
+        ["/usr/bin/lpstat", "-v", PRINTER], capture_output=True, text=True,
+        timeout=15, env={**os.environ, "LC_ALL": "C"})
+    ppd = Path("/etc/cups/ppd") / (PRINTER + ".ppd")
+    try:
+        has_driver = ppd.read_bytes().startswith(b'*PPD-Adobe:')
+    except OSError:
+        has_driver = False
+    return result.returncode == 0 and result.stdout.strip().endswith(PRINTER_URI) and has_driver
+
+
+def ensure_printer():
+    """Configure the built-in driver before submitting any document."""
+    if sys.platform != "darwin":
+        raise SetupError("print_msee requires macOS.")
+    try:
+        if printer_ready():
+            return
+        models = subprocess.run(["/usr/sbin/lpinfo", "-m"],
+                                capture_output=True, text=True, timeout=30)
+        if models.returncode != 0:
+            raise SetupError("Cannot query macOS printer drivers. Check the local print service and retry.")
+        if not any(line.split(maxsplit=1)[0] == DRIVER for line in models.stdout.splitlines() if line.strip()):
+            raise SetupError("The built-in Generic PostScript driver is missing from macOS. Repair/update macOS printing support, then retry; no document was submitted.")
+        if not Path("/usr/libexec/cups/backend/smb").is_file():
+            raise SetupError("macOS SMB printing support is missing. Repair/update macOS printing support, then retry.")
+        print("Setting up Purdue MSEE190 with the built-in Generic PostScript driver...", flush=True)
+        command = ["/usr/sbin/lpadmin", "-p", PRINTER, "-E", "-v", PRINTER_URI,
+                   "-m", DRIVER, "-D", "Purdue MSEE190", "-L", "MSEE 190",
+                   "-o", "auth-info-required=username,password",
+                   "-o", "printer-is-shared=false", "-o", "Option1=True",
+                   "-o", "PageSize=Letter", "-o", "Duplex=DuplexNoTumble"]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            print("macOS needs administrator permission to finish printer setup.", flush=True)
+            apple_command = "do shell script " + json.dumps(shlex.join(command)) + " with administrator privileges"
+            result = subprocess.run(["/usr/bin/osascript", "-e", apple_command],
+                                    capture_output=True, text=True, timeout=180)
+            if result.returncode != 0:
+                raise SetupError("Printer setup was canceled or failed. Retry and approve the macOS administrator prompt. No document was submitted.")
+        if not printer_ready():
+            raise SetupError("Printer setup did not produce a usable MSEE190 queue and driver. No document was submitted.")
+        print("Purdue MSEE190 printer is ready.", flush=True)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SetupError("Cannot finish macOS printer setup. Check the local print service and retry; no document was submitted.") from exc
 
 
 def credentials():
@@ -103,18 +160,28 @@ class Cups:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("pdf", type=Path)
+    parser.add_argument("pdf", type=Path, nargs="?")
+    parser.add_argument("--setup", action="store_true", help="check/install the printer without printing")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--single", action="store_true", help="print one-sided")
     mode.add_argument("--double", action="store_true", help="print two-sided, long-edge binding (default)")
     args = parser.parse_args()
+    if args.setup and args.pdf is not None:
+        parser.error("use --setup without a PDF")
+    if not args.setup and args.pdf is None:
+        parser.error("a PDF is required unless using --setup")
     job = None
     try:
+        if args.setup:
+            ensure_printer()
+            print("Printer setup verified.")
+            return 0
         path = args.pdf.expanduser().resolve()
         with path.open("rb") as source:
             if b"%PDF-" not in source.read(1024):
                 raise ValueError("Input is not a PDF")
         auth = credentials()
+        ensure_printer()
         cups = Cups()
         job = cups.submit(path, args.single)
         print(f"Submitted {PRINTER}-{job} ({'single' if args.single else 'double'}-sided)", flush=True)
@@ -135,6 +202,9 @@ def main():
             time.sleep(2)
         print("Job is still pending. Check Print Center before submitting again.", file=sys.stderr)
         return 2
+    except SetupError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except (OSError, ValueError):
         # Never echo exception content: malformed credentials may contain secrets.
         print("Printing could not complete. Check the PDF, ~/.print_msee (permissions 600), printer and Purdue connection.", file=sys.stderr)
